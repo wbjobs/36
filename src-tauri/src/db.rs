@@ -8,6 +8,46 @@ use tokio::sync::Mutex;
 
 use crate::models::*;
 
+/// 中文文本预处理：在中文字符之间插入空格，使 FTS5 unicode61 分词器能够正确分词
+/// 例如："搜索功能" -> "搜 索 功 能"
+pub fn tokenize_chinese(text: &str) -> String {
+    let mut result = String::with_capacity(text.len() * 2);
+    let chars: Vec<char> = text.chars().collect();
+    
+    for i in 0..chars.len() {
+        let c = chars[i];
+        result.push(c);
+        
+        // 检查是否是中文字符（CJK 统一表意文字）
+        let is_cjk = matches!(c as u32,
+            0x4E00..=0x9FFF |   // CJK 统一表意文字
+            0x3400..=0x4DBF |   // CJK 扩展 A
+            0x20000..=0x2A6DF | // CJK 扩展 B
+            0x2A700..=0x2B73F | // CJK 扩展 C
+            0x2B740..=0x2B81F | // CJK 扩展 D
+            0xF900..=0xFAFF     // CJK 兼容表意文字
+        );
+        
+        // 如果当前字符是中文字符，且下一个字符也是中文字符，插入空格
+        if is_cjk && i + 1 < chars.len() {
+            let next_c = chars[i + 1];
+            let next_is_cjk = matches!(next_c as u32,
+                0x4E00..=0x9FFF |
+                0x3400..=0x4DBF |
+                0x20000..=0x2A6DF |
+                0x2A700..=0x2B73F |
+                0x2B740..=0x2B81F |
+                0xF900..=0xFAFF
+            );
+            if next_is_cjk {
+                result.push(' ');
+            }
+        }
+    }
+    
+    result
+}
+
 static DB_PATH: Lazy<PathBuf> = Lazy::new(|| {
     let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("mail-client");
@@ -37,13 +77,87 @@ impl Database {
         };
         db.init_tables().await?;
         db.init_system_tags().await?;
+        db.run_migrations().await?;
         Ok(db)
+    }
+
+    /// 数据库迁移：重建 FTS5 索引以支持中文搜索
+    async fn run_migrations(&self) -> AppResult<()> {
+        let conn = self.conn.lock().await;
+        
+        // 检查数据库版本
+        let current_version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM db_version",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        const TARGET_VERSION: i64 = 1;
+        
+        if current_version >= TARGET_VERSION {
+            return Ok(());
+        }
+
+        // 迁移到版本 1：重建 FTS5 索引以支持中文搜索
+        if current_version < 1 {
+            log::info!("Running database migration to version 1: rebuild FTS5 index for Chinese search support");
+            
+            // 清空 FTS5 表
+            conn.execute("DELETE FROM emails_fts", [])?;
+            
+            // 为所有现有邮件重建 FTS5 索引
+            let mut stmt = conn.prepare(
+                "SELECT id, subject, sender_name, sender_email, body_text FROM emails"
+            )?;
+            
+            let email_rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            
+            let mut count = 0;
+            for email_result in email_rows {
+                let (id, subject, sender_name, sender_email, body_text) = email_result?;
+                
+                let subject_fts = tokenize_chinese(&subject);
+                let sender_name_fts = tokenize_chinese(&sender_name);
+                let sender_email_fts = tokenize_chinese(&sender_email);
+                let body_text_fts = tokenize_chinese(&body_text);
+                
+                conn.execute(
+                    "INSERT INTO emails_fts (rowid, subject, sender_name, sender_email, body_text)
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![id, subject_fts, sender_name_fts, sender_email_fts, body_text_fts],
+                )?;
+                count += 1;
+            }
+            
+            // 更新版本号
+            conn.execute(
+                "INSERT INTO db_version (version, applied_at) VALUES (?, ?)",
+                params![TARGET_VERSION, Utc::now().to_rfc3339()],
+            )?;
+            
+            log::info!("Migration complete: rebuilt FTS5 index for {} emails", count);
+        }
+
+        Ok(())
     }
 
     async fn init_tables(&self) -> AppResult<()> {
         let conn = self.conn.lock().await;
         conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS db_version (
+                version INTEGER PRIMARY KEY,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -116,27 +230,8 @@ impl Database {
                 sender_name,
                 sender_email,
                 body_text,
-                content='emails',
-                content_rowid='id',
                 tokenize='unicode61'
             );
-
-            CREATE TRIGGER IF NOT EXISTS emails_ai AFTER INSERT ON emails BEGIN
-                INSERT INTO emails_fts(rowid, subject, sender_name, sender_email, body_text)
-                VALUES (new.id, new.subject, new.sender_name, new.sender_email, new.body_text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS emails_ad AFTER DELETE ON emails BEGIN
-                INSERT INTO emails_fts(emails_fts, rowid, subject, sender_name, sender_email, body_text)
-                VALUES ('delete', old.id, old.subject, old.sender_name, old.sender_email, old.body_text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS emails_au AFTER UPDATE ON emails BEGIN
-                INSERT INTO emails_fts(emails_fts, rowid, subject, sender_name, sender_email, body_text)
-                VALUES ('delete', old.id, old.subject, old.sender_name, old.sender_email, old.body_text);
-                INSERT INTO emails_fts(rowid, subject, sender_name, sender_email, body_text)
-                VALUES (new.id, new.subject, new.sender_name, new.sender_email, new.body_text);
-            END;
             "#,
         )?;
         Ok(())
@@ -270,6 +365,13 @@ impl Database {
 
     pub async fn delete_account(&self, id: i64) -> AppResult<()> {
         let conn = self.conn.lock().await;
+        
+        // 先删除相关的 FTS5 记录
+        conn.execute(
+            "DELETE FROM emails_fts WHERE rowid IN (SELECT id FROM emails WHERE account_id = ?)",
+            params![id],
+        )?;
+        
         let result = conn.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
         if result == 0 {
             return Err(AppError::AccountNotFound);
@@ -323,6 +425,24 @@ impl Database {
                 ],
             )?;
         }
+
+        // 手动更新 FTS5 表，使用中文预处理后的文本
+        let subject_fts = tokenize_chinese(&email.subject);
+        let sender_name_fts = tokenize_chinese(&email.sender_name);
+        let sender_email_fts = tokenize_chinese(&email.sender_email);
+        let body_text_fts = tokenize_chinese(&email.body_text);
+        
+        conn.execute(
+            "INSERT INTO emails_fts (rowid, subject, sender_name, sender_email, body_text)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                email_id,
+                subject_fts,
+                sender_name_fts,
+                sender_email_fts,
+                body_text_fts,
+            ],
+        )?;
 
         Ok(email_id)
     }
@@ -483,10 +603,26 @@ impl Database {
     pub async fn search_emails(&self, query: &str, limit: i64, offset: i64) -> AppResult<EmailListResult> {
         let conn = self.conn.lock().await;
 
-        let search_query = format!("%{}%", query.replace("\"", "\"\""));
+        // 对搜索查询进行中文预处理
+        let processed_query = tokenize_chinese(query);
 
-        let count_query = "SELECT COUNT(*) FROM emails_fts WHERE emails_fts MATCH ?";
-        let total: i64 = conn.query_row(count_query, params![query], |row| row.get(0)).unwrap_or(0);
+        // 构建 FTS5 搜索查询，对每个词使用前缀匹配
+        let fts_query = processed_query
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("\"{}\"*", s.replace("\"", "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let total: i64 = if fts_query.is_empty() {
+            0
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM emails_fts WHERE emails_fts MATCH ?",
+                params![fts_query],
+                |row| row.get(0),
+            ).unwrap_or(0)
+        };
 
         let query_sql = "SELECT e.id, e.account_id, e.message_id, e.subject, e.sender_name, e.sender_email, 
                          e.recipients, e.date, e.body_text, e.body_html, e.is_read, e.is_flagged, e.uid, e.created_at
@@ -496,7 +632,7 @@ impl Database {
                          ORDER BY rank, e.date DESC LIMIT ? OFFSET ?";
 
         let mut stmt = conn.prepare(query_sql)?;
-        let email_rows = stmt.query_map(params![query, limit, offset], |row| {
+        let email_rows = stmt.query_map(params![fts_query, limit, offset], |row| {
             let date: String = row.get(7)?;
             let created_at: String = row.get(13)?;
             Ok(Email {
