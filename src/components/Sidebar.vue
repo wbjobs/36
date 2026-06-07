@@ -55,9 +55,40 @@
     </div>
 
     <div class="sidebar-footer">
+      <div class="sync-status" v-if="store.syncStatus.status !== 'Idle'">
+        <div class="sync-status-text">
+          <template v-if="store.syncStatus.status === 'Syncing'">
+            <span class="sync-spinner">⟳</span>
+            正在同步邮件...
+          </template>
+          <template v-else-if="store.syncStatus.status === 'Completed'">
+            <span class="sync-success">✓</span>
+            同步完成
+          </template>
+          <template v-else-if="store.syncStatus.status === 'Error'">
+            <span class="sync-error">✗</span>
+            同步失败
+          </template>
+        </div>
+        <div class="sync-details" v-if="store.syncStatus.status === 'Completed'">
+          <template v-for="result in store.syncStatus.data.results" :key="result.account_id">
+            <div v-if="result.new_emails > 0 || result.updated_emails > 0">
+              {{ result.account_name }}: 
+              <span v-if="result.new_emails > 0">{{ result.new_emails }} 封新邮件</span>
+              <span v-if="result.new_emails > 0 && result.updated_emails > 0">, </span>
+              <span v-if="result.updated_emails > 0">{{ result.updated_emails }} 封更新</span>
+            </div>
+          </template>
+        </div>
+      </div>
+      
+      <div class="last-sync" v-if="store.lastSyncTime">
+        上次同步: {{ formatTime(store.lastSyncTime) }}
+      </div>
+
       <button class="sync-btn" @click="syncAll" :disabled="store.syncing">
         <span v-if="store.syncing">⌛ 同步中...</span>
-        <span v-else>🔄 同步邮件</span>
+        <span v-else>🔄 立即同步</span>
       </button>
       <router-link to="/accounts" class="settings-link">
         ⚙️ 账户设置
@@ -69,6 +100,7 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
 import { useMailStore } from '@/stores/mail'
+import dayjs from 'dayjs'
 
 const store = useMailStore()
 const router = useRouter()
@@ -102,9 +134,14 @@ function getAccountUnread(accountId: number): number {
   return found ? found[2] : 0
 }
 
+function formatTime(time: Date | null): string {
+  if (!time) return ''
+  return dayjs(time).format('HH:mm:ss')
+}
+
 async function syncAll() {
   try {
-    await store.syncEmails()
+    await store.triggerSync()
   } catch (e) {
     console.error('Sync failed:', e)
     alert('同步失败: ' + e)
@@ -214,6 +251,57 @@ async function syncAll() {
   gap: 8px;
 }
 
+.sync-status {
+  background-color: var(--background);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.sync-status-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.sync-spinner {
+  animation: spin 1s linear infinite;
+  color: var(--primary);
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.sync-success {
+  color: #10b981;
+}
+
+.sync-error {
+  color: #ef4444;
+}
+
+.sync-details {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.sync-details > div {
+  margin-top: 2px;
+}
+
+.last-sync {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
 .sync-btn {
   width: 100%;
   padding: 10px 16px;
@@ -226,6 +314,11 @@ async function syncAll() {
 
 .sync-btn:hover:not(:disabled) {
   background-color: var(--primary-dark);
+}
+
+.sync-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .settings-link {

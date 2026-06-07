@@ -108,3 +108,9 @@ export interface UnreadCount {
   total: number
   by_account: Array<[number, string, number]>
 }
+
+export type SyncStatus =
+  | { status: 'Idle' }
+  | { status: 'Syncing'; data: { account_id: number | null } }
+  | { status: 'Completed'; data: { results: SyncResult[] } }
+  | { status: 'Error'; data: { message: string } }

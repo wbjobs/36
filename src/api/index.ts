@@ -6,7 +6,8 @@ import type {
   EmailDetail,
   SyncResult,
   Tag,
-  UnreadCount
+  UnreadCount,
+  SyncStatus
 } from '@/types'
 
 export const api = {
@@ -73,5 +74,13 @@ export const api = {
 
   getUnreadCount(): Promise<UnreadCount> {
     return invoke('get_unread_count')
+  },
+
+  getSyncStatus(): Promise<SyncStatus> {
+    return invoke('get_sync_status')
+  },
+
+  triggerSync(accountId?: number): Promise<SyncResult[]> {
+    return invoke('trigger_sync', { accountId })
   }
 }

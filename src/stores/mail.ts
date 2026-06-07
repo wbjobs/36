@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { api } from '@/api'
-import type { Account, AccountInput, EmailWithTags, EmailDetail, Tag, SyncResult, UnreadCount } from '@/types'
+import type { Account, AccountInput, EmailWithTags, EmailDetail, Tag, SyncResult, UnreadCount, SyncStatus } from '@/types'
 
 export const useMailStore = defineStore('mail', () => {
   const accounts = ref<Account[]>([])
@@ -15,6 +15,9 @@ export const useMailStore = defineStore('mail', () => {
   const unreadCount = ref<UnreadCount>({ total: 0, by_account: [] })
   const loading = ref(false)
   const syncing = ref(false)
+  const syncStatus = ref<SyncStatus>({ status: 'Idle' })
+  const lastSyncTime = ref<Date | null>(null)
+  let statusPollingInterval: number | null = null
 
   const hasAccounts = computed(() => accounts.value.length > 0)
 
@@ -80,6 +83,7 @@ export const useMailStore = defineStore('mail', () => {
     syncing.value = true
     try {
       const results = await api.syncEmails(accountId)
+      lastSyncTime.value = new Date()
       await loadEmails()
       await loadUnreadCount()
       return results
@@ -87,6 +91,66 @@ export const useMailStore = defineStore('mail', () => {
       syncing.value = false
     }
   }
+
+  async function triggerSync(accountId?: number): Promise<SyncResult[]> {
+    syncing.value = true
+    try {
+      const results = await api.triggerSync(accountId)
+      lastSyncTime.value = new Date()
+      await loadEmails()
+      await loadUnreadCount()
+      return results
+    } finally {
+      syncing.value = false
+    }
+  }
+
+  async function loadSyncStatus() {
+    syncStatus.value = await api.getSyncStatus()
+    if (syncStatus.value.status === 'Syncing') {
+      syncing.value = true
+    } else {
+      syncing.value = false
+    }
+  }
+
+  function startStatusPolling() {
+    if (statusPollingInterval) return
+    statusPollingInterval = window.setInterval(async () => {
+      try {
+        const wasSyncing = syncStatus.value.status === 'Syncing'
+        await loadSyncStatus()
+        const isSyncing = syncStatus.value.status === 'Syncing'
+        
+        // 同步完成时刷新邮件列表
+        if (wasSyncing && !isSyncing && syncStatus.value.status === 'Completed') {
+          const hasNew = syncStatus.value.data.results.some(r => r.new_emails > 0)
+          if (hasNew) {
+            await loadEmails()
+            await loadUnreadCount()
+            lastSyncTime.value = new Date()
+          }
+        }
+      } catch (e) {
+        console.error('Failed to poll sync status:', e)
+      }
+    }, 2000) // 每2秒轮询一次
+  }
+
+  function stopStatusPolling() {
+    if (statusPollingInterval) {
+      clearInterval(statusPollingInterval)
+      statusPollingInterval = null
+    }
+  }
+
+  onMounted(() => {
+    startStatusPolling()
+  })
+
+  onUnmounted(() => {
+    stopStatusPolling()
+  })
 
   async function markAsRead(id: number) {
     await api.markEmailRead(id)
@@ -173,6 +237,8 @@ export const useMailStore = defineStore('mail', () => {
     unreadCount,
     loading,
     syncing,
+    syncStatus,
+    lastSyncTime,
     hasAccounts,
     loadAccounts,
     addAccount,
@@ -182,6 +248,10 @@ export const useMailStore = defineStore('mail', () => {
     loadEmails,
     loadEmailDetail,
     syncEmails,
+    triggerSync,
+    loadSyncStatus,
+    startStatusPolling,
+    stopStatusPolling,
     markAsRead,
     markAsUnread,
     addTagToEmail,

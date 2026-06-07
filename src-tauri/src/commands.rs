@@ -1,5 +1,7 @@
 use crate::AppState;
 use crate::AppResult;
+use crate::SyncManager;
+use crate::SyncStatus;
 use crate::classifier::auto_classify_email;
 use crate::imap_client::ImapClient;
 use crate::models::*;
@@ -205,4 +207,24 @@ pub async fn get_tags(state: State<'_, AppState>) -> AppResult<Vec<Tag>> {
 pub async fn get_unread_count(state: State<'_, AppState>) -> AppResult<UnreadCount> {
     let db = state.db.lock().await;
     db.get_unread_count().await
+}
+
+#[command]
+pub async fn get_sync_status(sync_manager: State<'_, SyncManager>) -> AppResult<SyncStatus> {
+    Ok(sync_manager.get_status().await)
+}
+
+#[command]
+pub async fn trigger_sync(
+    account_id: Option<i64>,
+    app_state: State<'_, AppState>,
+    sync_manager: State<'_, SyncManager>,
+) -> AppResult<Vec<SyncResult>> {
+    // 创建一个 Arc<Mutex<AppState>> 供同步管理器使用
+    let shared_state = std::sync::Arc::new(tokio::sync::Mutex::new(AppState {
+        db: app_state.db.clone(),
+        notifier: app_state.notifier.clone(),
+    }));
+    
+    sync_manager.trigger_sync(account_id, shared_state).await
 }
